@@ -11,6 +11,7 @@ import datetime
 from imblearn.under_sampling import RandomUnderSampler
 import shutil
 import json
+import re
 
 class NameRecognizer():
 
@@ -19,9 +20,12 @@ class NameRecognizer():
         self.config = self.set_configurations()
         self.model_dir = self.par_dir+self.config['paths']['model_folder']
         self.data_dir = self.par_dir+self.config['paths']['data_folder']
+        self.prediction_dir = self.par_dir + self.config['paths']['prediction_folder']
         self.clf = None
         self.we_model = None
         self.dv = None
+
+        self.clean_folder(self.model_dir+'temp/')
 
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir+'/temp')
@@ -29,7 +33,7 @@ class NameRecognizer():
             os.makedirs(self.model_dir+'/temp')
 
     def train(self, clf_data_path, clf_model_path = None, we_data_path = None, we_model_path = None, dv_model_path = None,
-              epochs = None, batch_size = None, max_tokens = None):
+              epochs = None, batch_size = None, max_tokens = None, running_prediction = False):
 
         if batch_size is None:
             batch_size = self.config['training_params']['clf_params']['batch_size']
@@ -94,24 +98,26 @@ class NameRecognizer():
                         y[idx] = 0
 
                 try:
-                    print("Resampling")
-                    print(len(y))
                     rus = RandomUnderSampler(0.05)
                     x_transformed, y = rus.fit_resample(x_transformed,y)
-                    print(len(y))
 
                 except:
 
                     continue
 
                 loss = self.clf.model.train_on_batch(x_transformed, y)
-                if iterations % 10 == 0:
+                if iterations % self.config['training_params']['clf_params']['temp_model_save_interval'] == 0:
                     model_path = temp_folder + 'clf_epoch_{}_iter_{}_loss_{}'.format(epoch, iterations, loss[0])
                     self.clf.model.save(self.model_dir+model_path)
                     self.limit_temp_models(self.model_dir+temp_folder, 2)
-                    self.predict()
+
+                    if running_prediction:
+                        self.predict(overwrite=False)
                 print(loss)
                 iterations += 1
+
+        print("Training Done")
+        self.clf.model.save(self.model_dir+'clf_model')
 
     @staticmethod
     def build_train_we(epochs, min_count = 5, neurons=300, algorithm=0, window_size=10):
@@ -184,7 +190,7 @@ class NameRecognizer():
 
         return dv
 
-    def predict(self, clf_model_path = None, we_model_path = None, dv_model_path = None):
+    def predict(self, clf_model_path = None, we_model_path = None, dv_model_path = None, overwrite = True):
 
         if we_model_path is not None:
             self.we_model = word_embedder.WordEmbedder()
@@ -196,7 +202,7 @@ class NameRecognizer():
         if clf_model_path is not None:
             self.clf = load_model(self.model_dir+clf_model_path)
 
-        data_folder = self.data_dir+'/predictions/data_to_predict'
+        data_folder = self.prediction_dir+'data_to_predict'
 
         files_to_predict = os.listdir(data_folder)
 
@@ -228,31 +234,30 @@ class NameRecognizer():
                             all_words_to_predict.append(words[i])
                             # sentences.append(words)
 
-            # dv = joblib.load('dict_vectorizer.pkl')
             x_trans = self.dv.transform(x)
             x_w_embeddings = np.array(x_w_embeddings)
             x_w_embeddings = x_w_embeddings.reshape((x_w_embeddings.shape[0], -1))
-            print(np.shape(x_trans))
-
-            # print(all_words_to_predict)
 
             x_trans = np.array(x_trans)
             x_trans = np.append(x_trans, x_w_embeddings, axis=1)
             preds = self.clf.model.predict(x_trans)
 
-            predicted_folder = self.data_dir+'predictions/data_predicted'
+            predicted_folder = self.prediction_dir+'data_predicted'
             if not os.path.exists(predicted_folder):
                 os.makedirs(predicted_folder)
 
             for file_predict in files_to_save_prediction:
 
-                file_save_name = self.save_iterator(predicted_folder,file_predict)
+                if overwrite:
+                    file_save_name = file_predict
+                else:
+                    file_save_name = self.save_iterator(predicted_folder,file_predict)
 
                 with open(predicted_folder + '/' + file_save_name + '.txt', 'w') as f:
 
                     for index, word in enumerate(x_w_embeddings):
                         # print(all_words_to_predict[index])
-                        if preds[index] > 0.1:
+                        if preds[index] > self.config['prediction_params']['predict_threshold']:
                             f.write(all_words_to_predict[index] + ' ' + str(preds[index]) + '\n')
                             #f.write(WE.model.wv.most_similar(positive=[x_w_embeddings[index][:300],],topn=1)[0][0]+' '+str(preds[index])+'\n')
                         else:
@@ -276,15 +281,28 @@ class NameRecognizer():
         folder_entries = os.listdir(path)
         folder_entries.sort()
         current_models = 0
+        entries_numbers = []
 
-        for entry in folder_entries:
+        for idx, entry in enumerate(folder_entries):
             if entry.startswith('clf'):
+                epoch = entry.split('_')[2]
+                itera = entry.split('_')[4]
+                entries_numbers.append((int(str(epoch)+str(itera)),idx))
                 current_models += 1
 
         while current_models > n_temp_models:
-            os.remove(path+folder_entries[0])
-            folder_entries.pop(0)
-            current_models -= 1
+            lowest_num = 9999
+            lowest_index = -1
+
+            for num in entries_numbers:
+                if num[0] < lowest_num:
+                    lowest_num = num[0]
+                    lowest_index = num[1]
+
+            if not lowest_index == -1:
+                os.remove(path+folder_entries[lowest_index])
+                folder_entries.pop(lowest_index)
+                current_models -= 1
 
     def set_configurations(self):
 
@@ -298,12 +316,7 @@ class NameRecognizer():
                 "paths": {
                     "model_folder": "models/",
                     "data_folder": "data/",
-                    "clf_model_path": "clf_model",
-                    "we_model_path": "we_model",
-                    "dv_model_path": "dv_model",
-                    "clf_data_path": "labeled_data_copy_negative_list_kommune_fix.txt",
-                    "we_data_path": "name_recognizer/data/LeipzigCorpora",
-                    "dv_data_path": "labeled_data_copy_negative_list_kommune_fix.txt"
+                    "prediction_folder": "predictions/"
                 },
 
                 "training_params": {
@@ -314,6 +327,8 @@ class NameRecognizer():
                         "use_we": True,
                         "resampling": 0.05,
                         "temp_model_save_interval": 10,
+                        "max_temp_models": 2,
+                        "running_predictions": True,
                         "verbose": 1
                     },
 
@@ -334,6 +349,7 @@ class NameRecognizer():
                 "prediction_params": {
                     "predict_threshold": 0.5,
                     "file_suffix": "_prediction",
+                    "overwrite": True,
                     "data_to_predict_path": "predictions/data_to_predict/",
                     "predicted_data_path": "predictions/data_predicted/"
                 }
@@ -353,12 +369,20 @@ class NameRecognizer():
             if file.startswith(file_prefix):
                 iter_list.append(''.join(c for c in file if c.isdigit()))
 
+        iter_list = list(map(int, iter_list))
+
         iter_list = sorted(iter_list)
 
         if iter_list:
-            return file_prefix+str(int(iter_list[-1])+1)
+            return file_prefix+str(iter_list[-1]+1)
         else:
             return file_prefix+'1'
+
+    def atoi(text):
+        return int(text) if text.isdigit() else text
+
+    def natural_keys(text):
+        return [atoi(c) for c in re.split(r'(\d+)', text)]
 
 
 
